@@ -14,11 +14,15 @@ from torch.utils.data import DataLoader
 from torchmetrics import Accuracy
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
+import torch.optim.lr_scheduler as lr_scheduler
 
+import random
+from PIL import Image
 
 # Here we define a new class to turn the ResNet model that we want to use as a feature extractor
 # into a pytorch-lightning module so that we can take advantage of lightning's Trainer object.
 # We aim to make it a little more general by allowing users to define the number of prediction classes.
+
 class ResNetClassifier(pl.LightningModule):
     resnets = {
         18: models.resnet18,
@@ -31,13 +35,13 @@ class ResNetClassifier(pl.LightningModule):
 
     def __init__(
         self,
-        num_classes,
-        resnet_version,
-        train_path,
-        val_path,
+        num_classes=1,
+        resnet_version=152,
+        train_path=None,
+        val_path=None,
         test_path=None,
         optimizer="adam",
-        lr=1e-3,
+        lr=1e-4,
         batch_size=16,
         transfer=True,
         tune_fc_only=True,
@@ -72,11 +76,32 @@ class ResNetClassifier(pl.LightningModule):
                 for param in child.parameters():
                     param.requires_grad = False
 
+        self.class_names = None
+
+        # values here are specific to custom dataset
+        self.transform_pipeline = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.3983138093076698, 0.36474402870873407, 0.34729638794048745], 
+                std=[1.0, 1.0, 1.0]
+                )
+        ])
+
     def forward(self, X):
         return self.resnet_model(X)
 
     def configure_optimizers(self):
-        return self.optimizer(self.parameters(), lr=self.lr)
+        optimizer = self.optimizer(self.parameters(), lr=self.lr)
+
+        # Learning rate scheduler
+        def lr_lambda(epoch):
+            if epoch in [15, 30]:
+                return 0.1
+            else:
+                return 1
+
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return [optimizer], [scheduler]
 
     def _step(self, batch):
         x, y = batch
@@ -91,21 +116,18 @@ class ResNetClassifier(pl.LightningModule):
         return loss, acc
 
     def _dataloader(self, data_path, shuffle=False):
-        # values here are specific to pneumonia dataset and should be updated for custom data
-        transform = transforms.Compose(
-            [
-                transforms.Resize((500, 500)),
-                transforms.ToTensor(),
-                transforms.Normalize((0.48232,), (0.23051,)),
-            ]
-        )
+        img_folder = ImageFolder(data_path, transform=self.transform_pipeline)
 
-        img_folder = ImageFolder(data_path, transform=transform)
+        if self.class_names is None:  # Save class names during the first dataloader creation
+            self.class_names = img_folder.classes
 
         return DataLoader(img_folder, batch_size=self.batch_size, shuffle=shuffle)
 
     def train_dataloader(self):
-        return self._dataloader(self.train_path, shuffle=True)
+        if self.train_path is None:
+            pass
+        else:
+            return self._dataloader(self.train_path, shuffle=True)
 
     def training_step(self, batch, batch_idx):
         loss, acc = self._step(batch)
@@ -119,7 +141,10 @@ class ResNetClassifier(pl.LightningModule):
         return loss
 
     def val_dataloader(self):
-        return self._dataloader(self.val_path)
+        if self.val_path is None:
+            pass
+        else:
+            return self._dataloader(self.val_path)
 
     def validation_step(self, batch, batch_idx):
         loss, acc = self._step(batch)
@@ -135,6 +160,19 @@ class ResNetClassifier(pl.LightningModule):
         # perform logging
         self.log("test_loss", loss, on_step=True, prog_bar=True, logger=True)
         self.log("test_acc", acc, on_step=True, prog_bar=True, logger=True)
+
+    def predict(self, img):
+        img = self.transform_pipeline(img)
+        img = img.unsqueeze(0)
+
+        self.eval()  
+
+        with torch.no_grad():  
+            img = img.to(self.device) 
+            output = self(img) 
+            prediction = F.sigmoid(output)
+            
+        return prediction
 
 
 if __name__ == "__main__":
@@ -174,7 +212,7 @@ if __name__ == "__main__":
         "--learning_rate",
         help="Adjust learning rate of optimizer.",
         type=float,
-        default=1e-3,
+        default=1e-4,
     )
     parser.add_argument(
         "-b",
@@ -201,6 +239,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-g", "--gpus", help="""Enables GPU acceleration.""", type=int, default=None
     )
+
     args = parser.parse_args()
 
     # # Instantiate Model
@@ -227,20 +266,22 @@ if __name__ == "__main__":
         save_last=True,
     )
 
-    stopping_callback = pl.callbacks.EarlyStopping()
-
+    stopping_callback = pl.callbacks.EarlyStopping(monitor="val_acc", mode='max',  min_delta=0.00, patience=5, verbose=True)
+   
     # Instantiate lightning trainer and train model
     trainer_args = {
         "accelerator": "gpu" if args.gpus else None,
-        "devices": [1],
-        "strategy": "dp" if args.gpus > 1 else None,
+        "devices": [0],
         "max_epochs": args.num_epochs,
-        "callbacks": [checkpoint_callback],
+        "callbacks": [checkpoint_callback, stopping_callback],
         "precision": 16 if args.mixed_precision else 32,
+        
     }
     trainer = pl.Trainer(**trainer_args)
 
     trainer.fit(model)
+
+    wandb.finish()
 
     if args.test_set:
         trainer.test(model)
